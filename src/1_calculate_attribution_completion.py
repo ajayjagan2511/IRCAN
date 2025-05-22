@@ -26,7 +26,7 @@ def scaled_input(minimum_activations, maximum_activations, batch_size, num_batch
     step = (maximum_activations - minimum_activations) / num_points  # (1, ffn_size)
 
     res = torch.cat([torch.add(minimum_activations, step * i) for i in range(num_points)], dim=0)  # (num_points, ffn_size)
-    return res, step[0]
+    return res, step[0] # why [0]? - to make it 1D
 
 
 def convert_to_triplet_ig(ig_list):
@@ -49,6 +49,7 @@ def get_context_attr(idx, prompt_without_context, prompt_with_context, answer_ob
     
     wo_tokenized_inputs = tokenizer(prompt_without_context, return_tensors="pt")
     wo_input_ids = wo_tokenized_inputs["input_ids"].to(device)
+    # attention mask tells us where the padding is.
     wo_attention_mask = wo_tokenized_inputs["attention_mask"].to(device)
     
     w_tokenized_inputs = tokenizer(prompt_with_context, return_tensors="pt")
@@ -64,6 +65,7 @@ def get_context_attr(idx, prompt_without_context, prompt_with_context, answer_ob
         'all_attr_gold': [],
     }
 
+    # one layer at a time
     for tgt_layer in range(model.model.config.num_hidden_layers):
         wo_ffn_activations_dict = dict()
         def wo_forward_hook_fn(module, inp, outp):
@@ -73,11 +75,18 @@ def get_context_attr(idx, prompt_without_context, prompt_with_context, answer_ob
         def w_forward_hook_fn(module, inp, outp):
             w_ffn_activations_dict['input'] = inp[0]
         # ========================== get activations when there is no context in the prompt =========================
+        # Outer model is the class, inner model is the actual block. Layer number can be specified.
+        # within each layer, the first part is the attention, and the second part is the feed forward network(MLP).
+        # down projection is the final linear layer in the MLP.
+        # hook enables us to add a custom function to the forward pass of a layer. - w/wo_forward_hook_fn
         wo_hook = model.model.layers[tgt_layer].mlp.down_proj.register_forward_hook(wo_forward_hook_fn)
+        # Inference mode 
         with torch.no_grad():
             wo_outputs = model(input_ids=wo_input_ids, attention_mask=wo_attention_mask)
+        # get the activations
         wo_ffn_activations = wo_ffn_activations_dict['input']
         wo_ffn_activations = wo_ffn_activations[:, -1, :]
+        # get the logits
         wo_logits = wo_outputs.logits[:, -1, :]
         wo_hook.remove()
         
@@ -89,9 +98,11 @@ def get_context_attr(idx, prompt_without_context, prompt_with_context, answer_ob
         w_ffn_activations = w_ffn_activations[:, -1, :]
         w_logits = w_outputs.logits[:, -1, :]
         w_hook.remove()
-        
+
+        #enable gradient calculation with this as leaf node
         wo_ffn_activations.requires_grad_(True)
         w_ffn_activations.requires_grad_(True)
+        # create points from minimum_activations to maximum_activations for each <neuron?>
         scaled_activations, activations_step = scaled_input(wo_ffn_activations, w_ffn_activations, args.batch_size, args.num_batch)
         scaled_activations.requires_grad_(True)
 
@@ -100,32 +111,42 @@ def get_context_attr(idx, prompt_without_context, prompt_with_context, answer_ob
         for batch_idx in range(args.num_batch):
             grad = None
             all_grads = None
+            # range -> start, stop, step
             for i in range(0, args.batch_size, args.batch_size_per_inference):
                 # print(i, i + args.batch_size_per_inference)
+                # repeat - pytorch function that creates a new tensor by repeating the input tensor, 1 is the dimension to repeat 
                 batch_activations = scaled_activations[i: i + args.batch_size_per_inference] # (batch_size_per_inference, ffn_size)
                 batch_w_activations = w_ffn_activations.repeat(args.batch_size_per_inference, 1) # (batch_size_per_inference, ffn_size)
                 batched_w_input_ids = w_input_ids.repeat(args.batch_size_per_inference, 1) # (batch_size_per_inference, seq_len)
                 batched_w_attention_mask = w_attention_mask.repeat(args.batch_size_per_inference, 1) # (batch_size_per_inference, seq_len)
 
+                # inject scaled activations (multiple steps) into the model
                 def i_forward_hook_change_fn(module, inp):
                     inp0 = inp[0]
                     inp0[:, -1, :] = batch_activations
                     inp = tuple([inp0])
                     return inp
+                #pre hook means called before forward pass.
                 change_hook = model.model.layers[tgt_layer].mlp.down_proj.register_forward_pre_hook(i_forward_hook_change_fn)
-                
+                # output cacluatte for each of batch_size_per_inference pertubations (since repeat was used)
+                # args.batch_size_per_inference - this arg is used so that for large no of steps between w and w0, we dont go OOM (mini-batch)
+                # we can question that output is calculated per batch (for all steps) and not per neuron, but it doesnt matter as taking gradient will isolate the neuron 
                 outputs = model(input_ids=batched_w_input_ids, attention_mask=batched_w_attention_mask)  # (batch, n_vocab), (batch, ffn_size)
                 # compute final grad at a layer at the last position
                 tgt_logits = outputs.logits[:, -1, :] # (batch, n_vocab)
                 tgt_probs = F.softmax(tgt_logits, dim=1) # (batch, n_vocab)
                 # grads_i = torch.autograd.grad(torch.unbind(tgt_probs[:, gold_label_id]), batch_activations)
+                # Compute gradient of the gold‐token probability w.r.t. the FFN inputs - per neuron
                 grads_i = torch.autograd.grad(torch.unbind(tgt_probs[:, gold_label_id]), w_ffn_activations, retain_graph=True) # grads_i[0].shape: (1, ffn_size)
                 del tgt_probs
 
+                # remove the hook
                 change_hook.remove()  # check_ffn_activations_dict['output'][:,-1,:]
                 
                 all_grads = grads_i[0] if all_grads is None else torch.cat((all_grads, grads_i[0]), dim=0)
+            # grad per batch
             grad = all_grads.sum(dim=0)  # (ffn_size)
+            # total grad
             ig_gold = grad if ig_gold is None else torch.add(ig_gold, grad)  # (ffn_size)
             
         ig_gold = ig_gold * activations_step  # (ffn_size)
