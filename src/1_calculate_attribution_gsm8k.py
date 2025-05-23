@@ -26,7 +26,7 @@ def scaled_input(minimum_activations, maximum_activations, batch_size, num_batch
     step = (maximum_activations - minimum_activations) / num_points  # (1, ffn_size)
 
     res = torch.cat([torch.add(minimum_activations, step * i) for i in range(num_points)], dim=0)  # (num_points, ffn_size)
-    return res, step[0]
+    return res, step[0] # why [0]? - to make it 1D
 
 
 def convert_to_triplet_ig(ig_list):
@@ -41,21 +41,22 @@ def convert_to_triplet_ig(ig_list):
 
 
 def get_context_attr(idx, prompt_without_context, prompt_with_context, answer_obj, args, model, tokenizer, device):
-    # changed code: strip any leading 'A:' from the answer and tokenize only numeric part
-    raw = answer_obj
-    if raw.strip().upper().startswith("A:"):
-        raw = raw.split(":", 1)[1].strip()
-    tokens = tokenizer.tokenize(raw)
-    gold_label_id = tokenizer.convert_tokens_to_ids(tokens[0])
+    if "gemma" in args.model_name:
+        tokens = tokenizer.tokenize(f" {answer_obj}")   # Gemma needs leading space
+    else:
+        tokens = tokenizer.tokenize(answer_obj)
+    gold_label_ids = tokenizer.convert_tokens_to_ids(tokens)
 
     wo_tokenized_inputs = tokenizer(prompt_without_context, return_tensors="pt")
     wo_input_ids = wo_tokenized_inputs["input_ids"].to(device)
+    # attention mask tells us where the padding is.
     wo_attention_mask = wo_tokenized_inputs["attention_mask"].to(device)
-
+    
     w_tokenized_inputs = tokenizer(prompt_with_context, return_tensors="pt")
     w_input_ids = w_tokenized_inputs["input_ids"].to(device)
     w_attention_mask = w_tokenized_inputs["attention_mask"].to(device)
 
+    
     # record results
     res_dict = {
         'idx': idx,
@@ -64,68 +65,103 @@ def get_context_attr(idx, prompt_without_context, prompt_with_context, answer_ob
         'all_attr_gold': [],
     }
 
+    # one layer at a time
     for tgt_layer in range(model.model.config.num_hidden_layers):
-        wo_ffn_activations_dict = {}
+        wo_ffn_activations_dict = dict()
         def wo_forward_hook_fn(module, inp, outp):
-            wo_ffn_activations_dict['input'] = inp[0]
+            wo_ffn_activations_dict['input'] = inp[0]  # inp type is Tuple
 
-        w_ffn_activations_dict = {}
+        w_ffn_activations_dict = dict()
         def w_forward_hook_fn(module, inp, outp):
             w_ffn_activations_dict['input'] = inp[0]
-
-        # no-context
+        # ========================== get activations when there is no context in the prompt =========================
+        # Outer model is the class, inner model is the actual block. Layer number can be specified.
+        # within each layer, the first part is the attention, and the second part is the feed forward network(MLP).
+        # down projection is the final linear layer in the MLP.
+        # hook enables us to add a custom function to the forward pass of a layer. - w/wo_forward_hook_fn
         wo_hook = model.model.layers[tgt_layer].mlp.down_proj.register_forward_hook(wo_forward_hook_fn)
+        # Inference mode 
         with torch.no_grad():
             wo_outputs = model(input_ids=wo_input_ids, attention_mask=wo_attention_mask)
+        # get the activations
+        wo_ffn_activations = wo_ffn_activations_dict['input']
+        wo_ffn_activations = wo_ffn_activations[:, -1, :]
+        # get the logits
+        wo_logits = wo_outputs.logits[:, -1, :]
         wo_hook.remove()
-        wo_ffn_activations = wo_ffn_activations_dict['input'][:, -1, :]
-
-        # with-context
+        
+        # =========================== get activations when there is context in the prompt ============================
         w_hook = model.model.layers[tgt_layer].mlp.down_proj.register_forward_hook(w_forward_hook_fn)
         with torch.no_grad():
             w_outputs = model(input_ids=w_input_ids, attention_mask=w_attention_mask)
+        w_ffn_activations = w_ffn_activations_dict['input']
+        w_ffn_activations = w_ffn_activations[:, -1, :]
+        w_logits = w_outputs.logits[:, -1, :]
         w_hook.remove()
-        w_ffn_activations = w_ffn_activations_dict['input'][:, -1, :]
 
+        #enable gradient calculation with this as leaf node
         wo_ffn_activations.requires_grad_(True)
         w_ffn_activations.requires_grad_(True)
-        scaled_activations, activations_step = scaled_input(
-            wo_ffn_activations, w_ffn_activations,
-            args.batch_size, args.num_batch)
+        # create points from minimum_activations to maximum_activations for each <neuron?>
+        scaled_activations, activations_step = scaled_input(wo_ffn_activations, w_ffn_activations, args.batch_size, args.num_batch)
         scaled_activations.requires_grad_(True)
 
+        # integrated grad at the gold label for each layer
         ig_gold = None
-        for _ in range(args.num_batch):
+        for batch_idx in range(args.num_batch):
+            grad = None
             all_grads = None
+            # range -> start, stop, step
             for i in range(0, args.batch_size, args.batch_size_per_inference):
-                batch_scaled = scaled_activations[i:i+args.batch_size_per_inference]
-                batch_w = w_ffn_activations.repeat(args.batch_size_per_inference, 1)
-                b_ids = w_input_ids.repeat(args.batch_size_per_inference, 1)
-                b_mask = w_attention_mask.repeat(args.batch_size_per_inference, 1)
+                # print(i, i + args.batch_size_per_inference)
+                # repeat - pytorch function that creates a new tensor by repeating the input tensor, 1 is the dimension to repeat 
+                batch_activations = scaled_activations[i: i + args.batch_size_per_inference] # (batch_size_per_inference, ffn_size)
+                batch_w_activations = w_ffn_activations.repeat(args.batch_size_per_inference, 1) # (batch_size_per_inference, ffn_size)
+                batched_w_input_ids = w_input_ids.repeat(args.batch_size_per_inference, 1) # (batch_size_per_inference, seq_len)
+                batched_w_attention_mask = w_attention_mask.repeat(args.batch_size_per_inference, 1) # (batch_size_per_inference, seq_len)
 
-                def pre_hook(module, inp):
+                # inject scaled activations (multiple steps) into the model
+                def i_forward_hook_change_fn(module, inp):
                     inp0 = inp[0]
-                    inp0[:, -1, :] = batch_scaled
-                    return (inp0,)
-                hook = model.model.layers[tgt_layer].mlp.down_proj.register_forward_pre_hook(pre_hook)
+                    inp0[:, -1, :] = batch_activations
+                    inp = tuple([inp0])
+                    return inp
+                #pre hook means called before forward pass.
+                change_hook = model.model.layers[tgt_layer].mlp.down_proj.register_forward_pre_hook(i_forward_hook_change_fn)
+                # output cacluatte for each of batch_size_per_inference pertubations (since repeat was used)
+                # args.batch_size_per_inference - this arg is used so that for large no of steps between w and w0, we dont go OOM (mini-batch)
+                # we can question that output is calculated per batch (for all steps) and not per neuron, but it doesnt matter as taking gradient will isolate the neuron 
+                outputs = model(input_ids=batched_w_input_ids, attention_mask=batched_w_attention_mask)  # (batch, n_vocab), (batch, ffn_size)
+                # compute final grad at a layer at the last position
+                tgt_logits = outputs.logits[:, -1, :]   
+                tgt_probs  = F.softmax(tgt_logits, dim=1)
+                gold_probs = tgt_probs[:, gold_label_ids]     
+                if args.combine_method == "avg":
+                    gold_scalar = gold_probs.mean(dim=1)    
+                else:  # "sum"
+                    gold_scalar = gold_probs.sum(dim=1)   
+                # Compute gradient of the gold‐token probability w.r.t. the FFN inputs - per neuron
+                grads_i = torch.autograd.grad(
+                   torch.unbind(gold_scalar),               # list[scalar]
+                   w_ffn_activations,
+                   retain_graph=True
+               )
+                del tgt_probs
 
-                outputs = model(input_ids=b_ids, attention_mask=b_mask)
-                hook.remove()
-
-                logits = outputs.logits[:, -1, :]
-                probs = F.softmax(logits, dim=1)
-                grads = torch.autograd.grad(probs[:, gold_label_id].sum(), w_ffn_activations, retain_graph=True)[0]
-
-                all_grads = grads if all_grads is None else torch.cat((all_grads, grads), dim=0)
-
-            layer_grad = all_grads.sum(dim=0)
-            ig_gold = layer_grad if ig_gold is None else ig_gold + layer_grad
-
-        ig_gold = ig_gold * activations_step
+                # remove the hook
+                change_hook.remove()  # check_ffn_activations_dict['output'][:,-1,:]
+                
+                all_grads = grads_i[0] if all_grads is None else torch.cat((all_grads, grads_i[0]), dim=0)
+            # grad per batch
+            grad = all_grads.sum(dim=0)  # (ffn_size)
+            # total grad
+            ig_gold = grad if ig_gold is None else torch.add(ig_gold, grad)  # (ffn_size)
+            
+        ig_gold = ig_gold * activations_step  # (ffn_size)
         res_dict['wo_all_ffn_activations'].append(wo_ffn_activations.squeeze().tolist())
         res_dict['w_all_ffn_activations'].append(w_ffn_activations.squeeze().tolist())
         res_dict['all_attr_gold'].append(ig_gold.tolist())
-
+        
     return res_dict
 
 
@@ -133,72 +169,139 @@ def main():
     parser = argparse.ArgumentParser()
 
     # Basic parameters
-    parser.add_argument("--data_path", required=True, type=str,
-                        help="Input JSONL with keys: question, question_with_cot, final_answer.")
-    parser.add_argument("--model_path", required=True, type=str,
-                        help="HuggingFace model or local path.")
-    parser.add_argument("--output_dir", required=True, type=str,
-                        help="Output directory for results.")
-    parser.add_argument("--dataset_name", type=str, default=None,
-                        help="Name prefix for outputs.")
-    parser.add_argument("--model_name", type=str, default=None,
-                        help="Name prefix for outputs.")
-    parser.add_argument("--no_cuda", action='store_true', help="Do not use CUDA.")
-    parser.add_argument("--gpu_id", type=str, default='0', help="GPU id(s).")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--num_batch", type=int, default=1,
-                        help="IG interpolation steps.")
-    parser.add_argument("--batch_size", type=int, default=20,
-                        help="Total scaled points.")
-    parser.add_argument("--batch_size_per_inference", type=int, default=2,
+    parser.add_argument("--data_path",
+                        default=None,
+                        type=str,
+                        required=True,
+                        help="The input data path. Should be .json file for the MLM task. ")
+    parser.add_argument("--model_path", 
+                        default=None, 
+                        type=str, 
+                        required=True,
+                        help="Path to local pretrained model or model identifier from huggingface.co/models.")
+    parser.add_argument("--output_dir",
+                        default=None,
+                        type=str,
+                        required=True,
+                        help="The output directory where the model predictions and checkpoints will be written.")
+    parser.add_argument("--dataset_name",
+                        type=str,
+                        default=None,
+                        help="Dataset name as output prefix to indentify each running of experiment.")
+    parser.add_argument("--model_name",
+                        default=None,
+                        type=str,
+                        help="Model name as output prefix to indentify each running of experiment.")
+
+    # Other parameters
+    parser.add_argument("--max_seq_length",
+                        default=128,
+                        type=int,
+                        help="The maximum total input sequence length after WordPiece tokenization. \n"
+                            "Sequences longer than this will be truncated, and sequences shorter \n"
+                            "than this will be padded.")
+    parser.add_argument("--no_cuda",
+                        default=False,
+                        action='store_true',
+                        help="Whether not to use CUDA when available")
+    parser.add_argument("--gpu_id",
+                        type=str,
+                        default='0',
+                        help="available gpu id")
+    parser.add_argument('--seed',
+                        type=int,
+                        default=42,
+                        help="random seed for initialization")
+
+    # parameters about integrated grad
+    parser.add_argument("--num_batch",
+                        default=1,
+                        type=int,
+                        help="Number of examples for each run.")
+    parser.add_argument("--batch_size",
+                        default=20,
+                        type=int,
+                        help="The m in the paper.")
+    parser.add_argument("--batch_size_per_inference",
+                        default=2,
+                        type=int,
                         choices=[1,2,4,5,10,20],
-                        help="Batch size per inference.")
+                        help="The batch size for each inference, you can choose an appropriate value from 1, 2, 4, 5, 10, 20 according to the model size and CUDA mamory.")
+    parser.add_argument("--combine_method",
+                        default="sum",
+                        choices=["sum", "avg"],
+                        help="sum | avg over the final-answer token probs when computing the gradient.")
+
     args = parser.parse_args()
 
-    # device setup (unchanged)
+    # set device
     if args.no_cuda or not torch.cuda.is_available():
-        device = torch.device("cpu"); n_gpu = 0
+        device = torch.device("cpu")
+        n_gpu = 0
     elif len(args.gpu_id) == 1:
-        device = torch.device(f"cuda:{args.gpu_id}"); n_gpu = 1
+        device = torch.device("cuda:%s" % args.gpu_id)
+        n_gpu = 1
     else:
-        device = torch.device("cuda"); n_gpu = torch.cuda.device_count()
-    print(f"device: {device}, n_gpu: {n_gpu}, distributed: {n_gpu>1}")
+        # TODO: To implement multi gpus
+        pass
+    print("device: {} n_gpu: {}, distributed training: {}".format(device, n_gpu, bool(n_gpu > 1)))
 
-    random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
-    if n_gpu>0: torch.cuda.manual_seed_all(args.seed)
+
+    # set random seeds
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if n_gpu > 0:
+        torch.cuda.manual_seed_all(args.seed)
 
     output_prefix = f"{args.dataset_name}-{args.model_name}-context"
     os.makedirs(args.output_dir, exist_ok=True)
-    json.dump(vars(args), open(os.path.join(args.output_dir, output_prefix+'.args.json'), 'w'), indent=2)
+    json.dump(args.__dict__, open(os.path.join(args.output_dir, output_prefix + '.args.json'), 'w'), sort_keys=True, indent=2)
 
     # prepare dataset
-    with open(args.data_path, 'r') as fin:
-        data = [json.loads(l) for l in fin]
+    with open(args.data_path, "r", encoding="utf-8") as fin:
+        data = []
+        for json_line in fin:
+            line = json.loads(json_line)
+            data.append(line)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    print("***** CUDA.empty_cache() *****")
     torch.cuda.empty_cache()
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, use_cache=True, low_cpu_mem_usage=True, device_map=device)
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, use_cache=True, low_cpu_mem_usage=True, device_map=device)
+    
+    # tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    # model.resize_token_embeddings(len(tokenizer))
+    
+    # # data parallel
+    # if n_gpu > 1:
+    #     model = torch.nn.DataParallel(model)
+
     model.eval()
+    
 
     tic = time.perf_counter()
+    count = 0
     print(f"Start process, dataset size: {len(data)}")
-    with jsonlines.open(os.path.join(args.output_dir, output_prefix+'.rlt.jsonl'), 'w') as fw:
-        for idx, example in enumerate(tqdm(data, desc="Examples")):
-            # changed code: read GSM-8K format
+    with jsonlines.open(os.path.join(args.output_dir, output_prefix + '.rlt' + '.jsonl'), 'w') as fw:
+        for idx, example in enumerate(tqdm(data)):
+            answer_obj = example["final_answer"]
             prompt_without_context = example["question"]
-            prompt_with_context    = example["question_with_cot"]
-            answer_obj             = example["final_answer"]
-
-            res_dict = get_context_attr(
-                idx, prompt_without_context, prompt_with_context,
-                answer_obj, args, model, tokenizer, device)
+            prompt_with_context = example["question_with_cot"]
+            
+            res_dict = get_context_attr(idx, prompt_without_context, prompt_with_context, answer_obj, args, model, tokenizer, device)
             res_dict["all_attr_gold"] = convert_to_triplet_ig(res_dict["all_attr_gold"])
+            
             fw.write(res_dict)
+            count += 1
+        
+    print(f"Saved in {os.path.join(args.output_dir, output_prefix + '.rlt' + '.jsonl')}")
+
     toc = time.perf_counter()
-    print(f"Saved in {os.path.join(args.output_dir, output_prefix+'.rlt.jsonl')}")
-    print(f"Time: {toc-tic:.2f}s")
-    json.dump({"time":toc-tic}, open(os.path.join(args.output_dir, output_prefix+'.time.json'), 'w'))
+    time_str = f"***** Costing time: {toc - tic:0.4f} seconds *****"
+    print(time_str)
+    json.dump(time_str, open(os.path.join(args.output_dir, output_prefix + '.time.json'), 'w'))
+
 
 if __name__ == "__main__":
     main()
